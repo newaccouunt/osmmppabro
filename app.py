@@ -1,495 +1,772 @@
+"""
+═══════════════════════════════════════════════════════════════════════
+  BRONX ULTRA — All-In-One OSINT Platform
+  Single file app.py | Render.com Ready
+  Telegram: @BRONX_ULTRA
+═══════════════════════════════════════════════════════════════════════
+"""
+
 import os
 import json
-import requests
-import datetime
-from functools import wraps
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, session, make_response
-from flask_sqlalchemy import SQLAlchemy
-from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
-from werkzeug.security import generate_password_hash, check_password_hash
-from user_agents import parse
 import time
+import secrets
+import requests
+from datetime import datetime, timedelta
+from functools import wraps
+from flask import (
+    Flask, request, redirect, url_for,
+    session, jsonify, flash, send_file, abort, render_template_string
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
-# ==========================================
-# APP & DATABASE CONFIGURATION
-# ==========================================
+# ══════════════════════════════════════════════════════════════
+#  CONFIG
+# ══════════════════════════════════════════════════════════════
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'bronx_ultra_super_secret_key_123'
+app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
-# Render.com Database setup
-db_url = os.environ.get('DATABASE_URL', 'sqlite:///bronx.db')
-if db_url.startswith("postgres://"):
-    db_url = db_url.replace("postgres://", "postgresql://", 1)
-app.config['SQLALCHEMY_DATABASE_URI'] = db_url
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
 
-db = SQLAlchemy(app)
-login_manager = LoginManager()
-login_manager.init_app(app)
-login_manager.login_view = 'login'
-
-# ==========================================
-# FAMPAY API CONFIGURATION
-# ==========================================
-FAMPAY_API_KEY = "KTSQ8XXAVQMWQMPFML0T"
-FAMPAY_BASE_URL = "https://fampay-bronx-opop.onrender.com"
-
-# ==========================================
-# DDOS PROTECTION (Basic In-Memory Rate Limiter)
-# ==========================================
-ip_requests = {}
-BAN_TIME = 300  # 5 minutes ban
-MAX_REQUESTS = 60 # Max 60 requests per minute
-
-def check_ddos(ip):
-    now = time.time()
-    if ip in ip_requests:
-        reqs = [t for t in ip_requests[ip] if now - t < 60]
-        ip_requests[ip] = reqs
-        if len(reqs) > MAX_REQUESTS:
-            return False # Banned
-    else:
-        ip_requests[ip] = []
-    ip_requests[ip].append(now)
-    return True
-
-@app.before_request
-def ddos_protection():
-    ip = request.remote_addr
-    if not check_ddos(ip):
-        return "Access Denied: Too many requests. IP temporarily banned.", 429
-
-# ==========================================
-# DATABASE MODELS
-# ==========================================
-class User(UserMixin, db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(100))
-    username = db.Column(db.String(80), unique=True, nullable=False)
-    email = db.Column(db.String(120), unique=True, nullable=False)
-    password_hash = db.Column(db.String(256), nullable=False)
-    
-    # Hidden Info (Device & IP)
-    ip_address = db.Column(db.String(50))
-    browser_info = db.Column(db.String(200))
-    os_info = db.Column(db.String(100))
-    device_type = db.Column(db.String(50))
-    
-    # Prime Status
-    is_prime = db.Column(db.Boolean, default=False)
-    prime_expiry = db.Column(db.DateTime, nullable=True)
-    prime_limit = db.Column(db.Integer, default=0)
-    searches_used = db.Column(db.Integer, default=0)
-    prime_plan_name = db.Column(db.String(50))
-    
-    # History
-    history = db.relationship('SearchHistory', backref='user', lazy=True)
-
-class Feature(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(100), nullable=False)
-    icon = db.Column(db.String(50), default='fa-solid fa-magnifying-glass')
-    api_url = db.Column(db.String(255), nullable=False)
-    is_visible = db.Column(db.Boolean, default=True)
-
-class Transaction(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    amount = db.Column(db.Float, nullable=False)
-    plan_name = db.Column(db.String(50))
-    status = db.Column(db.String(20), default='PENDING')
-    order_id = db.Column(db.String(100), unique=True)
-    utr = db.Column(db.String(100), nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
-
-class SearchHistory(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    feature_name = db.Column(db.String(100))
-    query = db.Column(db.String(200))
-    result = db.Column(db.Text)
-    timestamp = db.Column(db.DateTime, default=datetime.datetime.utcnow)
-
-class Broadcast(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    message = db.Column(db.Text, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
-
-# ==========================================
-# PRIME PLANS (User Requested)
-# ==========================================
-PRIME_PLANS = {
-    "1":  {"days": 1,  "price": 20,   "limit": 10,   "name": "1 Day Plan"},
-    "5":  {"days": 5,  "price": 100,  "limit": 50,   "name": "5 Days Plan"},
-    "10": {"days": 10, "price": 200,  "limit": 100,  "name": "10 Days Plan"},
-    "15": {"days": 15, "price": 300,  "limit": 150,  "name": "15 Days Plan"},
-    "20": {"days": 20, "price": 400,  "limit": 200,  "name": "20 Days Plan"},
-    "30": {"days": 30, "price": 500,  "limit": 500,  "name": "30 Days Plan"},
-    "40": {"days": 40, "price": 700,  "limit": 800,  "name": "40 Days Plan"},
-    "60": {"days": 60, "price": 1199, "limit": 1500, "name": "60 Days Plan"},
-    "100":{"days": 100,"price": 2999, "limit": 5000, "name": "100 Days Plan"},
-    "180":{"days": 180,"price": 5999, "limit": 999999,"name": "180 Days Plan"}
-}
-
-@login_manager.user_loader
-def load_user(user_id):
-    return User.query.get(int(user_id))
-
-# ==========================================
-# HELPER FUNCTIONS
-# ==========================================
-def get_client_info():
-    ua_string = request.headers.get('User-Agent')
-    user_agent = parse(ua_string)
-    ip = request.remote_addr
-    browser = f"{user_agent.browser.family} {user_agent.browser.version_string}"
-    os = f"{user_agent.os.family} {user_agent.os.version_string}"
-    
-    if user_agent.is_mobile: device_type = "Mobile"
-    elif user_agent.is_tablet: device_type = "Tablet"
-    elif user_agent.is_pc: device_type = "Desktop"
-    else: device_type = "Unknown"
-        
-    return ip, browser, os, device_type
-
-# ==========================================
-# USER ROUTES
-# ==========================================
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    if request.method == 'POST':
-        name = request.form.get('name')
-        username = request.form.get('username')
-        email = request.form.get('email')
-        password = request.form.get('password')
-        
-        if len(password) < 5 or len(password) > 12:
-            flash('Password must be between 5 and 12 characters.', 'error')
-            return redirect(url_for('register'))
-            
-        if User.query.filter((User.username == username) | (User.email == email)).first():
-            flash('Username or Email already exists.', 'error')
-            return redirect(url_for('register'))
-            
-        ip, browser, os, device_type = get_client_info()
-        
-        new_user = User(
-            name=name, username=username, email=email, password_hash=generate_password_hash(password),
-            ip_address=ip, browser_info=browser, os_info=os, device_type=device_type
-        )
-        db.session.add(new_user)
-        db.session.commit()
-        
-        flash('Registration successful! Please login.', 'success')
-        return redirect(url_for('login'))
-    return render_template('register.html')
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        identifier = request.form.get('identifier')
-        password = request.form.get('password')
-        
-        user = User.query.filter((User.username == identifier) | (User.email == identifier)).first()
-        
-        if user and check_password_hash(user.password_hash, password):
-            ip, browser, os, device_type = get_client_info()
-            user.ip_address = ip
-            user.browser_info = browser
-            user.os_info = os
-            user.device_type = device_type
-            db.session.commit()
-            
-            login_user(user)
-            return redirect(url_for('dashboard'))
-        else:
-            flash('Invalid credentials.', 'error')
-            
-    return render_template('login.html')
-
-@app.route('/logout')
-@login_required
-def logout():
-    logout_user()
-    return redirect(url_for('index'))
-
-@app.route('/dashboard')
-@login_required
-def dashboard():
-    if current_user.is_prime and current_user.prime_expiry and current_user.prime_expiry < datetime.datetime.utcnow():
-        current_user.is_prime = False
-        db.session.commit()
-        
-    features = Feature.query.filter_by(is_visible=True).all()
-    broadcasts = Broadcast.query.order_by(Broadcast.created_at.desc()).limit(3).all()
-    now = datetime.datetime.now()
-    return render_template('dashboard.html', features=features, broadcasts=broadcasts, now=now)
-
-@app.route('/account')
-@login_required
-def account():
-    return render_template('account.html', plans=PRIME_PLANS)
-
-@app.route('/history')
-@login_required
-def history():
-    records = SearchHistory.query.filter_by(user_id=current_user.id).order_by(SearchHistory.timestamp.desc()).all()
-    return render_template('history.html', records=records)
-
-@app.route('/buy-prime')
-@login_required
-def buy_prime():
-    return render_template('buy_prime.html', plans=PRIME_PLANS)
-
-@app.route('/process-payment/<plan_key>')
-@login_required
-def process_payment(plan_key):
-    if plan_key not in PRIME_PLANS: return redirect(url_for('buy_prime'))
-        
-    plan = PRIME_PLANS[plan_key]
-    order_id = f"ORD{int(datetime.datetime.now().timestamp())}{current_user.id}"
-    
-    txn = Transaction(user_id=current_user.id, amount=plan['price'], plan_name=plan['name'], order_id=order_id, status='PENDING')
-    db.session.add(txn)
-    db.session.commit()
-    
-    payment_url = f"{FAMPAY_BASE_URL}/v2/fam/{FAMPAY_API_KEY}?qr={plan['price']}"
-    return render_template('payment.html', plan=plan, plan_key=plan_key, order_id=order_id, payment_url=payment_url)
-
-@app.route('/check-payment/<order_id>')
-@login_required
-def check_payment(order_id):
-    txn = Transaction.query.filter_by(order_id=order_id, user_id=current_user.id).first()
-    if not txn: return jsonify({"status": "ERROR"})
-    if txn.status == 'PAID': return jsonify({"status": "PAID"})
-        
-    try:
-        # FamPay Auto Check API
-        check_url = f"{FAMPAY_BASE_URL}/api/v2/check/{FAMPAY_API_KEY}?order_id={order_id}"
-        res = requests.get(check_url, timeout=10).json()
-        
-        if res.get('status') == 'PAID':
-            txn.status = 'PAID'
-            txn.utr = res.get('utr')
-            
-            plan_key = next((k for k, v in PRIME_PLANS.items() if v['price'] == txn.amount and v['name'] == txn.plan_name), None)
-            if plan_key:
-                plan = PRIME_PLANS[plan_key]
-                current_user.is_prime = True
-                current_user.prime_expiry = datetime.datetime.utcnow() + datetime.timedelta(days=plan['days'])
-                current_user.prime_limit = plan['limit']
-                current_user.searches_used = 0
-                current_user.prime_plan_name = plan['name']
-                
-            db.session.commit()
-            return jsonify({"status": "PAID"})
-        return jsonify({"status": "PENDING"})
-    except Exception as e:
-        return jsonify({"status": "ERROR", "msg": str(e)})
-
-@app.route('/feature/<int:feature_id>', methods=['GET', 'POST'])
-@login_required
-def feature(feature_id):
-    feat = Feature.query.get_or_404(feature_id)
-    
-    if not current_user.is_prime or (current_user.prime_expiry and current_user.prime_expiry < datetime.datetime.utcnow()):
-        flash('Active Prime subscription required.', 'error')
-        return redirect(url_for('buy_prime'))
-        
-    if current_user.searches_used >= current_user.prime_limit:
-        flash('Search limit reached. Please upgrade.', 'error')
-        return redirect(url_for('buy_prime'))
-
-    result = None
-    error = None
-    query = ""
-    
-    if request.method == 'POST':
-        query = request.form.get('query')
-        if query:
-            api_url = feat.api_url.replace('{p}', query)
-            try:
-                response = requests.get(api_url, timeout=15)
-                # JSON to Text Formatter
-                try:
-                    data = response.json()
-                    result = json.dumps(data, indent=4)
-                    if not data or "error" in str(data).lower() or "not found" in str(data).lower():
-                        error = "Result not found or API error. (No limit deducted)"
-                    else:
-                        current_user.searches_used += 1
-                        # Save to History
-                        hist = SearchHistory(user_id=current_user.id, feature_name=feat.name, query=query, result=result)
-                        db.session.add(hist)
-                        db.session.commit()
-                except ValueError:
-                    if response.text:
-                        result = response.text
-                        current_user.searches_used += 1
-                        hist = SearchHistory(user_id=current_user.id, feature_name=feat.name, query=query, result=result)
-                        db.session.add(hist)
-                        db.session.commit()
-                    else:
-                        error = "Empty response."
-            except Exception as e:
-                error = f"Failed to fetch data."
-
-    remaining = current_user.prime_limit - current_user.searches_used if current_user.is_prime else 0
-    return render_template('features.html', feature=feat, result=result, error=error, query=query, remaining=remaining)
-
-# ==========================================
-# ADMIN PANEL (HIDDEN ENDPOINT)
-# ==========================================
 ADMIN_USER = "bronx"
 ADMIN_PASS = "850956"
 
+FAMPAY_API_KEY = "KTSQ8XXAVQMWQMPFML0T"
+FAMPAY_BASE = "https://fampay-bronx-opop.onrender.com"
+
+limiter = Limiter(
+    get_remote_address, app=app,
+    default_limits=["300 per minute"],
+    storage_uri="memory://",
+)
+
+BANNED_IPS = {}
+
+# ══════════════════════════════════════════════════════════════
+#  STORAGE
+# ══════════════════════════════════════════════════════════════
+def load(name, default=None):
+    p = os.path.join(DATA_DIR, f"{name}.json")
+    if not os.path.exists(p):
+        return default if default is not None else ({} if name == "users" else [])
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default if default is not None else ({} if name == "users" else [])
+
+def save(name, data):
+    p = os.path.join(DATA_DIR, f"{name}.json")
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+def users():        return load("users", {})
+def features():     return load("features", [])
+def transactions(): return load("transactions", [])
+def plans():        return load("plans", [])
+
+# ══════════════════════════════════════════════════════════════
+#  DEFAULT DATA
+# ══════════════════════════════════════════════════════════════
+DEFAULT_PLANS = [
+    {"id":"p1",  "days":1,   "price":20,   "limit":10,   "label":"1 Day"},
+    {"id":"p5",  "days":5,   "price":100,  "limit":50,   "label":"5 Days"},
+    {"id":"p10", "days":10,  "price":200,  "limit":100,  "label":"10 Days"},
+    {"id":"p15", "days":15,  "price":300,  "limit":150,  "label":"15 Days"},
+    {"id":"p20", "days":20,  "price":400,  "limit":200,  "label":"20 Days"},
+    {"id":"p30", "days":30,  "price":500,  "limit":500,  "label":"30 Days"},
+    {"id":"p40", "days":40,  "price":700,  "limit":800,  "label":"40 Days"},
+    {"id":"p60", "days":60,  "price":1199, "limit":1500, "label":"60 Days"},
+    {"id":"p100","days":100, "price":2999, "limit":5000, "label":"100 Days"},
+    {"id":"p180","days":180, "price":5999, "limit":-1,   "label":"180 Days (Unlimited)"},
+]
+
+DEFAULT_FEATURES = [
+    {"id":"f1","name":"Mobile Number Info","icon":"fa-sim-card","api":"https://api.example.com/num={q}","input_label":"Mobile Number","visible":True,"free_limit":0,"prime_only":True},
+    {"id":"f2","name":"Aadhaar Lookup","icon":"fa-id-card","api":"https://api.example.com/aadhaar={q}","input_label":"Aadhaar Number","visible":True,"free_limit":0,"prime_only":True},
+    {"id":"f3","name":"PAN Card Info","icon":"fa-address-card","api":"https://api.example.com/pan={q}","input_label":"PAN Number","visible":True,"free_limit":0,"prime_only":True},
+    {"id":"f4","name":"Vehicle RC","icon":"fa-car-side","api":"https://api.example.com/rc={q}","input_label":"Vehicle Number","visible":True,"free_limit":0,"prime_only":True},
+    {"id":"f5","name":"GST Lookup","icon":"fa-file-invoice-dollar","api":"https://api.example.com/gst={q}","input_label":"GST Number","visible":True,"free_limit":0,"prime_only":True},
+    {"id":"f6","name":"Pincode Info","icon":"fa-location-dot","api":"https://api.postalpincode.in/pincode/{q}","input_label":"Pincode","visible":True,"free_limit":5,"prime_only":False},
+]
+
+for name, data in [("features", DEFAULT_FEATURES), ("plans", DEFAULT_PLANS), ("users", {}), ("transactions", [])]:
+    if not os.path.exists(os.path.join(DATA_DIR, f"{name}.json")):
+        save(name, data)
+
+# ══════════════════════════════════════════════════════════════
+#  AUTH DECORATORS
+# ══════════════════════════════════════════════════════════════
+def login_required(f):
+    @wraps(f)
+    def wrapper(*a, **k):
+        if "uid" not in session: return redirect(url_for("login_page"))
+        if session.get("uid") not in users():
+            session.clear(); return redirect(url_for("login_page"))
+        return f(*a, **k)
+    return wrapper
+
 def admin_required(f):
     @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if not session.get('admin_logged_in'): return redirect(url_for('admin_login'))
-        return f(*args, **kwargs)
-    return decorated_function
+    def wrapper(*a, **k):
+        if not session.get("admin"): return redirect(url_for("admin_login"))
+        return f(*a, **k)
+    return wrapper
 
-@app.route('/v3/bronx-server-admin-panel', methods=['GET', 'POST'])
+@app.before_request
+def block_banned():
+    ip = request.remote_addr or "unknown"
+    now = time.time()
+    if ip in BANNED_IPS and BANNED_IPS[ip] > now:
+        return jsonify({"error": "IP banned. Contact @BRONX_ULTRA on Telegram."}), 403
+
+# ══════════════════════════════════════════════════════════════
+#  HELPER: RENDER TEMPLATE (inline)
+# ══════════════════════════════════════════════════════════════
+def render(tpl, **ctx):
+    return render_template_string(tpl, **ctx)
+
+# ══════════════════════════════════════════════════════════════
+#  TEMPLATES (INLINE)
+# ══════════════════════════════════════════════════════════════
+
+BASE_HEAD = """
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+<style>
+*{font-family:'Plus Jakarta Sans',sans-serif}
+body{background:#0a0e1a;color:#fff;overflow-x:hidden;margin:0}
+.bg-grid{position:fixed;inset:0;z-index:-10;background-image:radial-gradient(rgba(77,107,254,0.12) 1px,transparent 1px);background-size:40px 40px}
+.glow{position:fixed;width:500px;height:500px;border-radius:50%;filter:blur(120px);opacity:.25;z-index:-9;pointer-events:none}
+.glow-1{top:-10%;left:-10%;background:#4D6BFE}.glow-2{bottom:-10%;right:-10%;background:#6B85FF}
+.btn-primary{background:linear-gradient(135deg,#4D6BFE,#3A54D6);box-shadow:0 10px 30px -8px rgba(77,107,254,.5);transition:all .3s}
+.btn-primary:hover{transform:translateY(-2px);box-shadow:0 15px 40px -8px rgba(77,107,254,.7)}
+.card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:16px;backdrop-filter:blur(20px);transition:all .3s}
+.card:hover{transform:translateY(-4px);border-color:rgba(77,107,254,.5)}
+.input{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.15);color:#fff;outline:none;transition:.2s}
+.input:focus{border-color:#4D6BFE;box-shadow:0 0 0 3px rgba(77,107,254,.2)}
+.nav-item{transition:.2s;border-left:3px solid transparent}
+.nav-item:hover{background:rgba(77,107,254,.15);border-left-color:#4D6BFE}
+.nav-item.active{background:rgba(77,107,254,.2);border-left-color:#4D6BFE;color:#6B85FF}
+.result-box{background:#000;border:1px solid rgba(255,255,255,.1);border-radius:12px;font-family:'SF Mono',Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word;max-height:500px;overflow-y:auto}
+::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-thumb{background:#334155;border-radius:10px}
+</style>
+<div class="bg-grid"></div>
+<div class="glow glow-1"></div>
+<div class="glow glow-2"></div>
+"""
+
+# ═══════ LANDING ═══════
+TPL_LANDING = BASE_HEAD + """
+<!DOCTYPE html><html><head><title>BRONX ULTRA — Premium OSINT Portal</title>"""+BASE_HEAD+"""</head>
+<body>
+<nav class="sticky top-0 z-50 backdrop-blur-xl bg-black/40 border-b border-white/10">
+  <div class="max-w-7xl mx-auto px-6 h-20 flex justify-between items-center">
+    <div class="flex items-center gap-3">
+      <div class="w-12 h-12 rounded-full bg-gradient-to-br from-indigo-500 to-blue-700 flex items-center justify-center shadow-lg">
+        <i class="fa-solid fa-bolt text-white text-xl"></i>
+      </div>
+      <span class="text-2xl font-black">BRONX <span class="text-indigo-400">ULTRA</span></span>
+    </div>
+    <div class="hidden md:flex gap-8 font-bold text-gray-300">
+      <a href="#features" class="hover:text-indigo-400">Features</a>
+      <a href="#pricing" class="hover:text-indigo-400">Pricing</a>
+      <a href="https://t.me/BRONX_ULTRA" target="_blank" class="hover:text-indigo-400"><i class="fa-brands fa-telegram mr-1"></i>Contact</a>
+    </div>
+    <div class="flex gap-3">
+      <a href="/login" class="px-5 py-2.5 rounded-full font-bold text-gray-300 hover:text-white border border-white/20">Login</a>
+      <a href="/register" class="btn-primary px-6 py-2.5 rounded-full font-bold text-white">Register</a>
+    </div>
+  </div>
+</nav>
+<section class="max-w-7xl mx-auto px-6 pt-24 pb-16 text-center">
+  <div class="inline-block px-5 py-2 bg-indigo-500/20 border border-indigo-500/40 rounded-full mb-8">
+    <span class="text-sm font-black text-indigo-300 tracking-widest">⚡ PREMIUM OSINT PLATFORM</span>
+  </div>
+  <h1 class="text-5xl md:text-7xl font-black leading-tight mb-6">
+    Digital Intelligence<br>
+    <span class="bg-gradient-to-r from-indigo-400 to-blue-400 bg-clip-text text-transparent">Redefined</span>
+  </h1>
+  <p class="text-lg md:text-xl text-gray-400 max-w-2xl mx-auto mb-10 font-medium">
+    India's most advanced OSINT platform. Mobile, Aadhaar, PAN, Vehicle, GST — get real-time verified data.
+  </p>
+  <div class="flex flex-col sm:flex-row gap-4 justify-center">
+    <a href="/register" class="btn-primary px-10 py-4 rounded-full font-black text-white text-lg">Get Started <i class="fa-solid fa-arrow-right ml-2"></i></a>
+    <a href="https://t.me/BRONX_ULTRA" target="_blank" class="px-10 py-4 rounded-full font-black border-2 border-white/20 text-white hover:border-indigo-400 flex items-center justify-center">
+      <i class="fa-brands fa-telegram mr-2 text-indigo-400"></i> Join Telegram
+    </a>
+  </div>
+</section>
+<section class="max-w-7xl mx-auto px-6 py-16">
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-6">
+    <div class="card p-6 text-center"><div class="text-4xl font-black text-indigo-400">10K+</div><div class="text-xs text-gray-400 uppercase tracking-widest mt-2">Users</div></div>
+    <div class="card p-6 text-center"><div class="text-4xl font-black text-indigo-400">50+</div><div class="text-xs text-gray-400 uppercase tracking-widest mt-2">Services</div></div>
+    <div class="card p-6 text-center"><div class="text-4xl font-black text-indigo-400">99.9%</div><div class="text-xs text-gray-400 uppercase tracking-widest mt-2">Uptime</div></div>
+    <div class="card p-6 text-center"><div class="text-4xl font-black text-indigo-400">24/7</div><div class="text-xs text-gray-400 uppercase tracking-widest mt-2">Support</div></div>
+  </div>
+</section>
+<section id="features" class="max-w-7xl mx-auto px-6 py-16">
+  <div class="text-center mb-12">
+    <h2 class="text-4xl font-black mb-3">Powerful Features</h2>
+    <p class="text-gray-400">Everything you need in one place</p>
+  </div>
+  <div class="grid md:grid-cols-3 gap-6">
+    {% for f in feats %}
+    <div class="card p-8">
+      <div class="w-14 h-14 rounded-xl bg-indigo-500/20 border border-indigo-500/40 flex items-center justify-center mb-4">
+        <i class="fa-solid {{ f.icon }} text-indigo-400 text-2xl"></i>
+      </div>
+      <h3 class="text-xl font-bold mb-2">{{ f.name }}</h3>
+      <p class="text-gray-400 text-sm">{% if f.prime_only %}Prime Only{% else %}Free: {{ f.free_limit }}/day{% endif %}</p>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+<section class="max-w-4xl mx-auto px-6 py-16">
+  <div class="card p-12 text-center relative overflow-hidden">
+    <div class="absolute inset-0 bg-gradient-to-r from-indigo-500/20 to-blue-500/20"></div>
+    <div class="relative">
+      <h2 class="text-4xl font-black mb-4">Start Today</h2>
+      <p class="text-gray-300 mb-8">Join thousands of professionals using BRONX ULTRA</p>
+      <a href="/register" class="btn-primary inline-block px-10 py-4 rounded-full font-black text-lg">Create Free Account <i class="fa-solid fa-arrow-right ml-2"></i></a>
+    </div>
+  </div>
+</section>
+<footer class="border-t border-white/10 py-8 text-center text-gray-500 text-sm">
+  <p>&copy; 2026 BRONX ULTRA. All rights reserved.</p>
+  <p class="mt-2"><a href="https://t.me/BRONX_ULTRA" class="text-indigo-400 hover:underline"><i class="fa-brands fa-telegram mr-1"></i> @BRONX_ULTRA</a></p>
+</footer>
+</body></html>
+"""
+
+# ═══════ LOGIN ═══════
+TPL_LOGIN = "<!DOCTYPE html><html><head><title>Login — BRONX ULTRA</title>"+BASE_HEAD+"</head><body class='min-h-screen flex items-center justify-center p-4'><div class='w-full max-w-md'><div class='text-center mb-8'><div class='inline-flex w-20 h-20 rounded-full bg-gradient-to-br from-indigo-500 to-blue-700 items-center justify-center mb-4'><i class='fa-solid fa-bolt text-3xl'></i></div><h1 class='text-3xl font-black'>BRONX <span class='text-indigo-400'>ULTRA</span></h1></div><div class='card p-8'><h2 class='text-2xl font-black mb-6 text-center'>Welcome Back</h2>{% if error %}<div class='bg-red-500/20 border border-red-500/40 text-red-300 p-3 rounded-lg mb-4 text-sm font-bold'>{{ error }}</div>{% endif %}{% with msgs = get_flashed_messages(with_categories=true) %}{% for cat, m in msgs %}<div class='bg-{{ 'green' if cat=='success' else 'red' }}-500/20 border border-{{ 'green' if cat=='success' else 'red' }}-500/40 p-3 rounded-lg mb-4 text-sm font-bold'>{{ m }}</div>{% endfor %}{% endwith %}<form method='POST' class='space-y-4'><div><label class='block text-sm font-bold text-gray-300 mb-1'>Email or Username</label><input type='text' name='ident' required class='input w-full p-3 rounded-lg'></div><div><label class='block text-sm font-bold text-gray-300 mb-1'>Password (5-12 chars)</label><input type='password' name='password' minlength='5' maxlength='12' required class='input w-full p-3 rounded-lg'></div><button type='submit' class='w-full py-3 rounded-lg bg-gradient-to-r from-indigo-500 to-blue-700 font-black'><i class='fa-solid fa-sign-in-alt mr-2'></i> Login</button></form><p class='text-center text-gray-400 text-sm mt-6'>No account? <a href='/register' class='text-indigo-400 font-bold hover:underline'>Register</a></p><p class='text-center text-gray-500 text-xs mt-4'><a href='https://t.me/BRONX_ULTRA' class='hover:text-indigo-400'><i class='fa-brands fa-telegram mr-1'></i> @BRONX_ULTRA</a></p></div></div></body></html>"
+
+# ═══════ REGISTER ═══════
+TPL_REGISTER = "<!DOCTYPE html><html><head><title>Register — BRONX ULTRA</title>"+BASE_HEAD+"</head><body class='min-h-screen flex items-center justify-center p-4 py-10'><div class='w-full max-w-md'><div class='text-center mb-8'><div class='inline-flex w-20 h-20 rounded-full bg-gradient-to-br from-indigo-500 to-blue-700 items-center justify-center mb-4'><i class='fa-solid fa-bolt text-3xl'></i></div><h1 class='text-3xl font-black'>BRONX <span class='text-indigo-400'>ULTRA</span></h1></div><div class='card p-8'><h2 class='text-2xl font-black mb-6 text-center'>Create Account</h2>{% if error %}<div class='bg-red-500/20 border border-red-500/40 text-red-300 p-3 rounded-lg mb-4 text-sm font-bold'>{{ error }}</div>{% endif %}<form method='POST' class='space-y-4'><div><label class='block text-sm font-bold text-gray-300 mb-1'>Full Name</label><input type='text' name='name' required minlength='2' class='input w-full p-3 rounded-lg'></div><div><label class='block text-sm font-bold text-gray-300 mb-1'>Username</label><input type='text' name='username' required minlength='3' class='input w-full p-3 rounded-lg'></div><div><label class='block text-sm font-bold text-gray-300 mb-1'>Email</label><input type='email' name='email' required class='input w-full p-3 rounded-lg'></div><div><label class='block text-sm font-bold text-gray-300 mb-1'>Password (5-12 chars)</label><input type='password' name='password' minlength='5' maxlength='12' required class='input w-full p-3 rounded-lg'></div><button type='submit' class='w-full py-3 rounded-lg bg-gradient-to-r from-indigo-500 to-blue-700 font-black'><i class='fa-solid fa-user-plus mr-2'></i> Register</button></form><p class='text-center text-gray-400 text-sm mt-6'>Already have an account? <a href='/login' class='text-indigo-400 font-bold hover:underline'>Login</a></p><p class='text-center text-gray-500 text-xs mt-4'><a href='https://t.me/BRONX_ULTRA' class='hover:text-indigo-400'><i class='fa-brands fa-telegram mr-1'></i> @BRONX_ULTRA</a></p></div></div></body></html>"
+
+# ═══════ DASHBOARD ═══════
+TPL_DASHBOARD = "<!DOCTYPE html><html><head><title>Dashboard — BRONX ULTRA</title>"+BASE_HEAD+"""<style>.sidebar{background:rgba(10,14,26,.95);backdrop-filter:blur(20px);border-right:1px solid rgba(255,255,255,.08)}</style></head>
+<body><div class='flex min-h-screen'>
+<aside class='sidebar w-64 hidden md:flex flex-col sticky top-0 h-screen'>
+<div class='p-6 border-b border-white/10'><div class='flex items-center gap-3'><div class='w-10 h-10 rounded-full bg-gradient-to-br from-indigo-500 to-blue-700 flex items-center justify-center'><i class='fa-solid fa-bolt'></i></div><div><div class='font-black text-lg'>BRONX <span class='text-indigo-400'>ULTRA</span></div><div class='text-[10px] font-black text-indigo-400 uppercase tracking-widest'>OSINT</div></div></div></div>
+<nav class='flex-1 py-4 overflow-y-auto'>
+<div class='text-[10px] font-black text-gray-500 uppercase tracking-widest px-6 py-2'>Main</div>
+<a href='/dashboard' class='nav-item active flex items-center gap-3 px-6 py-3 font-bold'><i class='fa-solid fa-gauge-high w-5'></i> Dashboard</a>
+<a href='/history' class='nav-item flex items-center gap-3 px-6 py-3 font-bold'><i class='fa-solid fa-clock-rotate-left w-5'></i> History</a>
+<a href='/account' class='nav-item flex items-center gap-3 px-6 py-3 font-bold'><i class='fa-solid fa-user w-5'></i> Account</a>
+<div class='text-[10px] font-black text-gray-500 uppercase tracking-widest px-6 py-2 mt-4'>Tools</div>
+{% for f in feats %}<a href='/feature/{{ f.id }}' class='nav-item flex items-center gap-3 px-6 py-3 font-bold'><i class='fa-solid {{ f.icon }} w-5'></i> {{ f.name }}</a>{% endfor %}
+<div class='text-[10px] font-black text-gray-500 uppercase tracking-widest px-6 py-2 mt-4'>Premium</div>
+<a href='/prime' class='nav-item flex items-center gap-3 px-6 py-3 font-bold text-yellow-400'><i class='fa-solid fa-crown w-5'></i> Buy Prime</a>
+</nav>
+<div class='p-4 border-t border-white/10'><a href='/logout' class='flex items-center justify-center gap-2 w-full py-3 bg-red-500/20 border border-red-500/40 text-red-300 rounded-xl font-bold hover:bg-red-500/30'><i class='fa-solid fa-power-off'></i> Logout</a></div>
+</aside>
+<main class='flex-1 min-w-0'>
+<header class='sticky top-0 z-40 backdrop-blur-xl bg-black/40 border-b border-white/10 p-4 flex justify-between items-center'>
+<div><h1 class='text-xl font-black'>Dashboard</h1><p class='text-xs text-gray-400'>{{ now }}</p></div>
+<div class='flex items-center gap-3'><a href='/prime' class='px-5 py-2.5 rounded-full bg-gradient-to-r from-yellow-500 to-orange-600 font-black text-white text-sm shadow-lg shadow-yellow-500/30'><i class='fa-solid fa-crown mr-1'></i> Buy Prime</a>
+<div class='w-10 h-10 rounded-full bg-indigo-500/30 border border-indigo-500/50 flex items-center justify-center font-black'>{{ user.name[0]|upper }}</div></div>
+</header>
+<div class='p-6 md:p-8'>
+{% if not prime_active %}
+<div class='card p-6 mb-6 border-yellow-500/40'><div class='flex items-center gap-4'><i class='fa-solid fa-crown text-3xl text-yellow-400'></i><div class='flex-1'><h3 class='font-black'>You're not a PRIME user</h3><p class='text-sm text-gray-400'>Unlock all premium features with a Prime plan.</p></div><a href='/prime' class='px-5 py-2 rounded-lg bg-gradient-to-r from-yellow-500 to-orange-600 font-black text-sm'>Buy Now</a></div></div>
+{% else %}
+<div class='card p-6 mb-6 border-green-500/40'><div class='flex items-center gap-4'><i class='fa-solid fa-crown text-3xl text-green-400'></i><div class='flex-1'><h3 class='font-black'>PRIME Active ✓</h3><p class='text-sm text-gray-400'>Expires: {{ user.prime_expires[:10] if user.prime_expires else '-' }} · Used: {{ user.prime_used }} / {{ user.prime_limit if user.prime_limit > 0 else '∞' }}</p></div></div></div>
+{% endif %}
+<div class='card p-6 mb-6'><h2 class='text-2xl font-black mb-1'>Welcome, {{ user.name }}!</h2><p class='text-gray-400'>Choose a tool to start your lookup</p></div>
+<div class='grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4'>
+{% for f in feats %}
+<a href='/feature/{{ f.id }}' class='card p-6 block'>
+<div class='w-14 h-14 rounded-xl bg-indigo-500/20 border border-indigo-500/40 flex items-center justify-center mb-4 text-indigo-400'><i class='fa-solid {{ f.icon }} text-2xl'></i></div>
+<h3 class='font-black mb-1'>{{ f.name }}</h3>
+<p class='text-xs text-gray-400'>{% if f.prime_only %}<i class='fa-solid fa-crown text-yellow-400 mr-1'></i>Prime only{% else %}Free: {{ f.free_limit }}/day{% endif %}</p>
+</a>
+{% endfor %}
+</div>
+</div></main></div></body></html>"""
+
+# ═══════ FEATURE ═══════
+TPL_FEATURE = "<!DOCTYPE html><html><head><title>{{ feature.name }} — BRONX ULTRA</title>"+BASE_HEAD+"""</head><body class='min-h-screen p-4 md:p-8'><div class='max-w-4xl mx-auto'>
+<a href='/dashboard' class='inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-white/5 border border-white/10 text-sm font-bold hover:bg-white/10 mb-6'><i class='fa-solid fa-arrow-left'></i> Dashboard</a>
+<div class='card p-8 mb-6'>
+<div class='flex items-center gap-4 mb-6'><div class='w-16 h-16 rounded-xl bg-indigo-500/20 border border-indigo-500/40 flex items-center justify-center text-indigo-400'><i class='fa-solid {{ feature.icon }} text-3xl'></i></div><div><h1 class='text-3xl font-black'>{{ feature.name }}</h1><p class='text-sm text-gray-400'>{% if remaining is not none %}Remaining: <b class='text-indigo-400'>{{ remaining }}</b>{% else %}Unlimited{% endif %}</p></div></div>
+{% if error %}<div class='bg-red-500/20 border border-red-500/40 text-red-300 p-4 rounded-lg mb-4 font-bold'><i class='fa-solid fa-triangle-exclamation mr-2'></i>{{ error }}</div>{% endif %}
+{% if prime_ok %}
+<form method='POST' class='space-y-4'>
+<div><label class='block text-sm font-black text-indigo-400 uppercase mb-2'>{{ feature.input_label }}</label><input type='text' name='query' required class='input w-full p-4 rounded-xl font-bold' placeholder='Enter {{ feature.input_label }}'></div>
+<button type='submit' class='w-full py-4 rounded-xl bg-gradient-to-r from-indigo-500 to-blue-700 font-black text-lg'><i class='fa-solid fa-search mr-2'></i> Lookup</button>
+</form>
+{% endif %}
+</div>
+{% if result %}<div class='card p-6'><h3 class='font-black text-indigo-400 mb-3'><i class='fa-solid fa-check-circle mr-2'></i>Result</h3><div class='result-box p-4 text-sm'>{{ result }}</div></div>{% endif %}
+</div></body></html>"""
+
+# ═══════ PRIME ═══════
+TPL_PRIME = "<!DOCTYPE html><html><head><title>Buy Prime — BRONX ULTRA</title>"+BASE_HEAD+"</head><body class='min-h-screen p-4 md:p-8'><div class='max-w-6xl mx-auto'><a href='/dashboard' class='inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-white/5 border border-white/10 text-sm font-bold hover:bg-white/10 mb-6'><i class='fa-solid fa-arrow-left'></i> Dashboard</a><div class='text-center mb-12'><div class='inline-flex w-20 h-20 rounded-full bg-gradient-to-br from-yellow-400 to-orange-600 items-center justify-center mb-4'><i class='fa-solid fa-crown text-4xl text-white'></i></div><h1 class='text-5xl font-black mb-2'>PRIME PLANS</h1><p class='text-gray-400'>Unlock all OSINT features instantly</p></div><div class='grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4'>{% for p in plans %}<div class='card p-6'><div class='flex justify-between items-start mb-4'><div><h3 class='text-2xl font-black'>{{ p.label }}</h3><p class='text-sm text-gray-400'>Limit: {% if p.limit == -1 %}Unlimited{% else %}{{ p.limit }} searches{% endif %}</p></div>{% if p.limit == -1 %}<div class='px-2 py-1 rounded bg-yellow-500 text-black text-[10px] font-black'>UNLIMITED</div>{% endif %}</div><div class='text-4xl font-black text-yellow-400 mb-4'>₹{{ p.price }}</div><a href='/buy-prime/{{ p.id }}' class='block w-full py-3 rounded-xl bg-gradient-to-r from-yellow-500 to-orange-600 font-black text-center'>Buy Now <i class='fa-solid fa-arrow-right ml-1'></i></a></div>{% endfor %}</div></div></body></html>"
+
+# ═══════ ACCOUNT ═══════
+TPL_ACCOUNT = "<!DOCTYPE html><html><head><title>Account — BRONX ULTRA</title>"+BASE_HEAD+"</head><body class='min-h-screen p-4 md:p-8'><div class='max-w-4xl mx-auto'><a href='/dashboard' class='inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-white/5 border border-white/10 text-sm font-bold hover:bg-white/10 mb-6'><i class='fa-solid fa-arrow-left'></i> Dashboard</a>{% with msgs = get_flashed_messages(with_categories=true) %}{% for cat, m in msgs %}<div class='bg-{{ 'green' if cat=='success' else 'red' }}-500/20 border border-{{ 'green' if cat=='success' else 'red' }}-500/40 p-3 rounded-lg mb-4 text-sm font-bold'>{{ m }}</div>{% endfor %}{% endwith %}<div class='card p-8 mb-6'><h1 class='text-3xl font-black mb-6'>Account Info</h1><div class='grid grid-cols-1 md:grid-cols-2 gap-4'><div><div class='text-xs text-indigo-400 font-black uppercase mb-1'>Name</div><div class='font-bold'>{{ user.name }}</div></div><div><div class='text-xs text-indigo-400 font-black uppercase mb-1'>Username</div><div class='font-bold'>{{ user.username }}</div></div><div><div class='text-xs text-indigo-400 font-black uppercase mb-1'>Email</div><div class='font-bold'>{{ user.email }}</div></div><div><div class='text-xs text-indigo-400 font-black uppercase mb-1'>User ID</div><div class='font-mono text-sm'>{{ user.uid }}</div></div><div><div class='text-xs text-indigo-400 font-black uppercase mb-1'>Device</div><div class='font-bold'>{{ user.device }}</div></div><div><div class='text-xs text-indigo-400 font-black uppercase mb-1'>IP</div><div class='font-mono text-sm'>{{ user.ip }}</div></div></div></div><div class='card p-8 mb-6'><h2 class='text-xl font-black mb-4'>Prime Status</h2>{% if prime_active %}<div class='bg-green-500/20 border border-green-500/40 p-4 rounded-lg'><p class='font-black text-green-400'><i class='fa-solid fa-crown mr-2'></i>PRIME ACTIVE</p><p class='text-sm mt-2'>Expires: <b>{{ user.prime_expires[:19] }}</b></p><p class='text-sm'>Used: <b>{{ user.prime_used }}</b> / <b>{{ '∞' if user.prime_limit == -1 else user.prime_limit }}</b></p></div>{% else %}<div class='bg-yellow-500/20 border border-yellow-500/40 p-4 rounded-lg'><p class='font-black text-yellow-400'>Not Active</p><a href='/prime' class='inline-block mt-2 px-4 py-2 bg-yellow-500 rounded-lg font-bold text-black'>Buy Prime</a></div>{% endif %}</div><div class='card p-8'><h2 class='text-xl font-black mb-4'>Change Password</h2><form method='POST' action='/change-password' class='space-y-3'><input type='password' name='old' placeholder='Old password' required class='input w-full p-3 rounded-lg'><input type='password' name='new' placeholder='New password (5-12)' minlength='5' maxlength='12' required class='input w-full p-3 rounded-lg'><button class='w-full py-3 rounded-lg bg-indigo-500 font-black'>Update Password</button></form></div></div></body></html>"
+
+# ═══════ HISTORY ═══════
+TPL_HISTORY = "<!DOCTYPE html><html><head><title>History — BRONX ULTRA</title>"+BASE_HEAD+"</head><body class='min-h-screen p-4 md:p-8'><div class='max-w-4xl mx-auto'><a href='/dashboard' class='inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-white/5 border border-white/10 text-sm font-bold hover:bg-white/10 mb-6'><i class='fa-solid fa-arrow-left'></i> Dashboard</a><div class='card p-8'><h1 class='text-3xl font-black mb-6'>Lookup History</h1>{% if history %}<div class='space-y-2'>{% for h in history %}<div class='flex items-center justify-between p-3 rounded-lg bg-white/5 border border-white/10'><div><div class='font-bold'>{{ h.feature }}</div><div class='text-xs text-gray-400'>Query: {{ h.query }}</div></div><div class='text-xs text-gray-400'>{{ h.time[:16] }}</div></div>{% endfor %}</div>{% else %}<p class='text-gray-400 text-center py-10'>No history yet.</p>{% endif %}</div></div></body></html>"
+
+# ═══════ ADMIN LOGIN ═══════
+TPL_ADMIN_LOGIN = "<!DOCTYPE html><html><head><title>Admin — BRONX ULTRA</title>"+BASE_HEAD+"</head><body class='min-h-screen flex items-center justify-center p-4'><div class='w-full max-w-md'><div class='card p-8'><h1 class='text-2xl font-black mb-6 text-center'><i class='fa-solid fa-lock mr-2 text-indigo-400'></i>Admin Access</h1>{% if error %}<div class='bg-red-500/20 border border-red-500/40 text-red-300 p-3 rounded-lg mb-4 text-sm font-bold'>{{ error }}</div>{% endif %}<form method='POST' action='/v3/bronx-server-admin-panel/login' class='space-y-4'><input type='text' name='user' placeholder='Username' required class='input w-full p-3 rounded-lg'><input type='password' name='pass' placeholder='Password' required class='input w-full p-3 rounded-lg'><button class='w-full py-3 rounded-lg bg-gradient-to-r from-indigo-500 to-blue-700 font-black'>Login</button></form></div></div></body></html>"
+
+# ═══════ ADMIN PANEL ═══════
+TPL_ADMIN_PANEL = "<!DOCTYPE html><html><head><title>Admin Panel — BRONX ULTRA</title>"+BASE_HEAD+"""</head><body class='min-h-screen p-4 md:p-8'><div class='max-w-7xl mx-auto'>
+<div class='flex justify-between items-center mb-6'><h1 class='text-3xl font-black'><i class='fa-solid fa-shield-halved mr-2 text-indigo-400'></i>Admin Panel</h1><a href='/v3/bronx-server-admin-panel/logout' class='px-4 py-2 rounded-lg bg-red-500/20 border border-red-500/40 text-red-300 font-bold text-sm'>Logout</a></div>
+{% with msgs = get_flashed_messages(with_categories=true) %}{% for cat, m in msgs %}<div class='bg-{{ 'green' if cat=='success' else 'red' }}-500/20 border border-{{ 'green' if cat=='success' else 'red' }}-500/40 p-3 rounded-lg mb-4 text-sm font-bold'>{{ m }}</div>{% endfor %}{% endwith %}
+<div class='grid grid-cols-2 md:grid-cols-4 gap-4 mb-6'>
+<div class='card p-5'><div class='text-xs text-gray-400 uppercase font-black mb-1'>Total Users</div><div class='text-3xl font-black text-indigo-400'>{{ stats.users }}</div></div>
+<div class='card p-5'><div class='text-xs text-gray-400 uppercase font-black mb-1'>Prime Users</div><div class='text-3xl font-black text-yellow-400'>{{ stats.prime_users }}</div></div>
+<div class='card p-5'><div class='text-xs text-gray-400 uppercase font-black mb-1'>Payments</div><div class='text-3xl font-black text-green-400'>{{ stats.total_payments }}</div></div>
+<div class='card p-5'><div class='text-xs text-gray-400 uppercase font-black mb-1'>Revenue</div><div class='text-3xl font-black text-green-400'>₹{{ stats.total_revenue }}</div></div>
+</div>
+<div class='card p-6 mb-6'><h2 class='text-xl font-black mb-4'><i class='fa-solid fa-database mr-2'></i>Backup & Restore</h2><div class='flex flex-wrap gap-3 items-center'><a href='/v3/bronx-server-admin-panel/export' class='px-4 py-2 rounded-lg bg-green-500/20 border border-green-500/40 text-green-300 font-bold text-sm'><i class='fa-solid fa-download mr-1'></i> Export All Data</a><form method='POST' action='/v3/bronx-server-admin-panel/import' enctype='multipart/form-data' class='flex gap-2'><input type='file' name='backup' accept='.json' required class='px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-sm'><button class='px-4 py-2 rounded-lg bg-blue-500/20 border border-blue-500/40 text-blue-300 font-bold text-sm'><i class='fa-solid fa-upload mr-1'></i> Import</button></form></div></div>
+<div class='card p-6 mb-6'><h2 class='text-xl font-black mb-4'><i class='fa-solid fa-bullhorn mr-2'></i>Broadcast Message</h2><form method='POST' action='/v3/bronx-server-admin-panel/broadcast' class='flex gap-2'><input type='text' name='msg' placeholder='Message for all users' required class='input flex-1 p-3 rounded-lg'><button class='px-5 py-3 rounded-lg bg-indigo-500 font-black'>Send</button></form></div>
+<div class='card p-6 mb-6'><h2 class='text-xl font-black mb-4'><i class='fa-solid fa-plus mr-2'></i>Add Feature</h2><form method='POST' action='/v3/bronx-server-admin-panel/features/add' class='grid grid-cols-1 md:grid-cols-2 gap-3'><input type='text' name='name' placeholder='Feature Name' required class='input p-3 rounded-lg'><input type='text' name='icon' placeholder='FA icon e.g. fa-star' value='fa-star' class='input p-3 rounded-lg'><input type='text' name='api' placeholder='API URL with {q} placeholder' required class='input p-3 rounded-lg col-span-2'><input type='text' name='input_label' placeholder='Input Label' required class='input p-3 rounded-lg'><input type='number' name='free_limit' placeholder='Free limit' value='0' class='input p-3 rounded-lg'><label class='flex items-center gap-2 text-sm'><input type='checkbox' name='prime_only' class='w-4 h-4'> Prime only</label><button class='md:col-span-2 py-3 rounded-lg bg-indigo-500 font-black'>Add Feature</button></form></div>
+<div class='card p-6 mb-6'><h2 class='text-xl font-black mb-4'><i class='fa-solid fa-list mr-2'></i>Manage Features</h2>{% for f in features %}<div class='flex items-center gap-3 p-3 rounded-lg bg-white/5 mb-2'><i class='fa-solid {{ f.icon }} text-indigo-400 w-6'></i><div class='flex-1 min-w-0'><div class='font-bold'>{{ f.name }}</div><div class='text-xs text-gray-400 truncate'>{{ f.api }}</div></div><a href='/v3/bronx-server-admin-panel/features/{{ f.id }}/toggle' class='px-3 py-1 rounded bg-{{ 'green' if f.visible else 'red' }}-500/20 text-{{ 'green' if f.visible else 'red' }}-300 text-xs font-bold'>{{ 'Visible' if f.visible else 'Hidden' }}</a><a href='/v3/bronx-server-admin-panel/features/{{ f.id }}/delete' onclick=\"return confirm('Delete?')\" class='px-3 py-1 rounded bg-red-500/20 text-red-300 text-xs font-bold'>Delete</a></div>{% endfor %}</div>
+<div class='card p-6 mb-6'><h2 class='text-xl font-black mb-4'><i class='fa-solid fa-tags mr-2'></i>Price Setup</h2><form method='POST' action='/v3/bronx-server-admin-panel/plans/update'><div class='grid grid-cols-1 md:grid-cols-2 gap-3 mb-3'>{% for p in plans %}<div class='p-3 rounded-lg bg-white/5'><div class='font-bold mb-2'>{{ p.label }}</div><div class='flex gap-2'><input type='number' name='price_{{ p.id }}' value='{{ p.price }}' placeholder='Price' class='input p-2 rounded flex-1 text-sm'><input type='number' name='limit_{{ p.id }}' value='{{ p.limit }}' placeholder='Limit' class='input p-2 rounded flex-1 text-sm'></div></div>{% endfor %}</div><button class='w-full py-3 rounded-lg bg-indigo-500 font-black'>Save Plans</button></form></div>
+<div class='card p-6 mb-6'><h2 class='text-xl font-black mb-4'><i class='fa-solid fa-users mr-2'></i>All Users ({{ stats.users }})</h2><div class='overflow-x-auto'><table class='w-full text-sm'><thead class='text-xs uppercase text-gray-400 border-b border-white/10'><tr><th class='p-2 text-left'>User</th><th class='p-2 text-left'>Email</th><th class='p-2 text-left'>Device</th><th class='p-2 text-left'>IP</th><th class='p-2 text-left'>Prime</th><th class='p-2 text-left'>Created</th></tr></thead><tbody>{% for uid, u in users.items() %}<tr class='border-b border-white/5'><td class='p-2 font-bold'>{{ u.username }}</td><td class='p-2 text-gray-400'>{{ u.email }}</td><td class='p-2 text-gray-400 text-xs'>{{ u.device }}</td><td class='p-2 font-mono text-xs'>{{ u.ip }}</td><td class='p-2'>{% if u.prime %}<span class='text-yellow-400 font-bold'>✓</span>{% else %}—{% endif %}</td><td class='p-2 text-xs text-gray-400'>{{ u.created_at[:10] }}</td></tr>{% endfor %}</tbody></table></div></div>
+<div class='card p-6'><h2 class='text-xl font-black mb-4'><i class='fa-solid fa-receipt mr-2'></i>Recent Transactions</h2>{% if transactions %}<div class='space-y-2'>{% for t in transactions %}<div class='flex justify-between p-3 rounded-lg bg-white/5 text-sm'><div><div class='font-bold'>{{ t.username }} — {{ t.plan }}</div><div class='text-xs text-gray-400'>{{ t.txn_id or '' }} · {{ t.time[:16] }}</div></div><div class='font-black text-green-400'>₹{{ t.amount }}</div></div>{% endfor %}</div>{% else %}<p class='text-gray-400 text-center py-6'>No transactions yet.</p>{% endif %}</div>
+</div></body></html>"""
+
+# ══════════════════════════════════════════════════════════════
+#  ROUTES — PUBLIC
+# ══════════════════════════════════════════════════════════════
+@app.route("/")
+def landing():
+    return render(TPL_LANDING, feats=[f for f in features() if f.get("visible", True)])
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "time": datetime.now().isoformat(), "brand": "BRONX ULTRA"})
+
+# ══════════════════════════════════════════════════════════════
+#  AUTH
+# ══════════════════════════════════════════════════════════════
+@app.route("/register", methods=["GET", "POST"])
+@limiter.limit("5 per minute")
+def register_page():
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        username = request.form.get("username", "").strip().lower()
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+
+        if not name or len(name) < 2:
+            return render(TPL_REGISTER, error="Name required (min 2 chars)")
+        if not username or len(username) < 3:
+            return render(TPL_REGISTER, error="Username min 3 chars")
+        if "@" not in email:
+            return render(TPL_REGISTER, error="Valid email required")
+        if not (5 <= len(password) <= 12):
+            return render(TPL_REGISTER, error="Password 5-12 characters")
+
+        db = users()
+        for uid, u in db.items():
+            if u["email"] == email:
+                return render(TPL_REGISTER, error="Email already registered")
+            if u["username"] == username:
+                return render(TPL_REGISTER, error="Username taken")
+
+        ua = request.headers.get("User-Agent", "")
+        device = "Unknown"
+        if "iPhone" in ua: device = "iPhone"
+        elif "Android" in ua: device = "Android Mobile"
+        elif "iPad" in ua: device = "iPad"
+        elif "Windows" in ua: device = "Windows PC"
+        elif "Mac" in ua: device = "Mac"
+        elif "Linux" in ua: device = "Linux"
+
+        uid = "U" + secrets.token_hex(6).upper()
+        db[uid] = {
+            "uid": uid, "name": name, "username": username, "email": email,
+            "password": generate_password_hash(password),
+            "created_at": datetime.now().isoformat(),
+            "ip": request.remote_addr, "device": device,
+            "user_agent": ua[:300],
+            "prime": False, "prime_expires": None,
+            "prime_limit": 0, "prime_used": 0,
+            "history": []
+        }
+        save("users", db)
+        session["uid"] = uid
+        return redirect(url_for("dashboard"))
+
+    return render(TPL_REGISTER)
+
+@app.route("/login", methods=["GET", "POST"])
+@limiter.limit("10 per minute")
+def login_page():
+    if request.method == "POST":
+        ident = request.form.get("ident", "").strip().lower()
+        password = request.form.get("password", "")
+
+        if not (5 <= len(password) <= 12):
+            return render(TPL_LOGIN, error="Password 5-12 chars")
+
+        db = users()
+        found = None
+        for uid, u in db.items():
+            if u["email"] == ident or u["username"] == ident:
+                found = u
+                break
+        if not found or not check_password_hash(found["password"], password):
+            return render(TPL_LOGIN, error="Invalid credentials")
+
+        session["uid"] = found["uid"]
+        return redirect(url_for("dashboard"))
+
+    return render(TPL_LOGIN)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("landing"))
+
+# ══════════════════════════════════════════════════════════════
+#  DASHBOARD
+# ══════════════════════════════════════════════════════════════
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    db = users()
+    me = db[session["uid"]]
+    feats = [f for f in features() if f.get("visible", True)]
+
+    prime_active = False
+    if me.get("prime") and me.get("prime_expires"):
+        try:
+            if datetime.fromisoformat(me["prime_expires"]) > datetime.now():
+                prime_active = True
+            else:
+                me["prime"] = False
+                db[me["uid"]] = me
+                save("users", db)
+        except Exception:
+            pass
+
+    return render(TPL_DASHBOARD, user=me, feats=feats, prime_active=prime_active,
+                  now=datetime.now().strftime("%d %b %Y, %I:%M %p"))
+
+# ══════════════════════════════════════════════════════════════
+#  FEATURE (with API call)
+# ══════════════════════════════════════════════════════════════
+@app.route("/feature/<fid>", methods=["GET", "POST"])
+@login_required
+def feature_page(fid):
+    feats = features()
+    feat = next((f for f in feats if f["id"] == fid and f.get("visible", True)), None)
+    if not feat:
+        abort(404)
+
+    db = users()
+    me = db[session["uid"]]
+
+    prime_ok = False
+    if me.get("prime") and me.get("prime_expires"):
+        try:
+            prime_ok = datetime.fromisoformat(me["prime_expires"]) > datetime.now()
+        except Exception:
+            pass
+
+    if feat.get("prime_only") and not prime_ok:
+        return render(TPL_FEATURE, feature=feat, user=me, prime_ok=False,
+                      error="⛔ This feature requires PRIME. Buy from /prime", remaining=None)
+
+    if prime_ok and me.get("prime_limit", 0) > 0:
+        if me.get("prime_used", 0) >= me["prime_limit"]:
+            return render(TPL_FEATURE, feature=feat, user=me, prime_ok=True,
+                          error="⛔ Usage limit reached. Buy new plan.", remaining=0)
+
+    result = None
+    error = None
+    remaining = None
+
+    if request.method == "POST":
+        query = request.form.get("query", "").strip()
+        if not query:
+            error = "Enter a value"
+        else:
+            api_url = feat["api"].replace("{q}", query)
+            try:
+                r = requests.get(api_url, timeout=25, headers={"Accept": "application/json", "User-Agent": "BRONX-ULTRA"})
+                txt = r.text
+                try:
+                    data = r.json()
+                    result = json.dumps(data, indent=2, ensure_ascii=False)
+                except Exception:
+                    result = txt
+
+                is_error = (
+                    not txt.strip()
+                    or "not found" in txt.lower()[:200]
+                    or "error" in txt.lower()[:100] and len(txt) < 60
+                    or r.status_code >= 400
+                )
+
+                if not is_error:
+                    if me.get("prime_limit", 0) > 0:
+                        me["prime_used"] = me.get("prime_used", 0) + 1
+                    me.setdefault("history", []).insert(0, {
+                        "feature": feat["name"], "query": query,
+                        "time": datetime.now().isoformat(), "success": True
+                    })
+                    me["history"] = me["history"][:50]
+                    db[session["uid"]] = me
+                    save("users", db)
+
+            except Exception as e:
+                error = f"API Error: {str(e)[:200]}"
+
+    if me.get("prime_limit", 0) > 0:
+        remaining = max(0, me["prime_limit"] - me.get("prime_used", 0))
+
+    return render(TPL_FEATURE, feature=feat, user=me, prime_ok=prime_ok,
+                  result=result, error=error, remaining=remaining)
+
+# ══════════════════════════════════════════════════════════════
+#  ACCOUNT & HISTORY
+# ══════════════════════════════════════════════════════════════
+@app.route("/account")
+@login_required
+def account():
+    me = users()[session["uid"]]
+    prime_active = False
+    if me.get("prime") and me.get("prime_expires"):
+        try:
+            prime_active = datetime.fromisoformat(me["prime_expires"]) > datetime.now()
+        except Exception:
+            pass
+    return render(TPL_ACCOUNT, user=me, prime_active=prime_active)
+
+@app.route("/change-password", methods=["POST"])
+@login_required
+def change_password():
+    old = request.form.get("old", "")
+    new = request.form.get("new", "")
+    if not (5 <= len(new) <= 12):
+        flash("New password must be 5-12 characters", "error")
+        return redirect(url_for("account"))
+
+    db = users()
+    me = db[session["uid"]]
+    if not check_password_hash(me["password"], old):
+        flash("Old password is wrong", "error")
+        return redirect(url_for("account"))
+
+    me["password"] = generate_password_hash(new)
+    db[session["uid"]] = me
+    save("users", db)
+    flash("Password updated successfully", "success")
+    return redirect(url_for("account"))
+
+@app.route("/history")
+@login_required
+def history_page():
+    me = users()[session["uid"]]
+    return render(TPL_HISTORY, user=me, history=me.get("history", []))
+
+# ══════════════════════════════════════════════════════════════
+#  PRIME / PAYMENT
+# ══════════════════════════════════════════════════════════════
+@app.route("/prime")
+@login_required
+def prime_page():
+    return render(TPL_PRIME, user=users()[session["uid"]], plans=plans())
+
+@app.route("/buy-prime/<pid>")
+@login_required
+def buy_prime(pid):
+    plan = next((p for p in plans() if p["id"] == pid), None)
+    if not plan:
+        abort(404)
+    return redirect(f"{FAMPAY_BASE}/v2/fam/{FAMPAY_API_KEY}?qr={plan['price']}&minutes=30")
+
+@app.route("/verify-prime/<pid>", methods=["POST"])
+@login_required
+def verify_prime(pid):
+    plan = next((p for p in plans() if p["id"] == pid), None)
+    if not plan:
+        return jsonify({"ok": False, "msg": "Plan not found"})
+
+    order_id = request.json.get("order_id") if request.is_json else None
+    if not order_id:
+        return jsonify({"ok": False, "msg": "No order_id"})
+
+    try:
+        r = requests.get(f"{FAMPAY_BASE}/api/v2/check/{FAMPAY_API_KEY}?order_id={order_id}", timeout=15)
+        data = r.json()
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)})
+
+    if data.get("status") != "PAID":
+        return jsonify({"ok": False, "msg": data.get("status", "PENDING")})
+
+    db = users()
+    me = db[session["uid"]]
+    days = plan["days"]
+    expires = datetime.now() + timedelta(days=days)
+    me["prime"] = True
+    me["prime_expires"] = expires.isoformat()
+    me["prime_limit"] = plan["limit"]
+    me["prime_used"] = 0
+    db[session["uid"]] = me
+    save("users", db)
+
+    txs = transactions()
+    txs.append({
+        "uid": me["uid"], "username": me["username"],
+        "plan": plan["label"], "amount": plan["price"],
+        "txn_id": data.get("txn_id"), "utr": data.get("utr"),
+        "status": "PAID", "time": datetime.now().isoformat()
+    })
+    save("transactions", txs)
+
+    return jsonify({"ok": True, "msg": "Prime activated", "expires": expires.isoformat()})
+
+# ══════════════════════════════════════════════════════════════
+#  ADMIN
+# ══════════════════════════════════════════════════════════════
+@app.route("/v3/bronx-server-admin-panel")
 def admin_login():
-    if request.method == 'POST':
-        if request.form.get('username') == ADMIN_USER and request.form.get('password') == ADMIN_PASS:
-            session['admin_logged_in'] = True
-            return redirect(url_for('admin_dashboard'))
-        flash('Invalid admin credentials', 'error')
-    return render_template('admin_login.html')
+    if session.get("admin"):
+        return redirect(url_for("admin_panel"))
+    return render(TPL_ADMIN_LOGIN)
 
-@app.route('/v3/bronx-server-admin-panel/dashboard')
+@app.route("/v3/bronx-server-admin-panel/login", methods=["POST"])
+@limiter.limit("5 per minute")
+def admin_login_post():
+    u = request.form.get("user", "")
+    p = request.form.get("pass", "")
+    if u == ADMIN_USER and p == ADMIN_PASS:
+        session["admin"] = True
+        return redirect(url_for("admin_panel"))
+    return render(TPL_ADMIN_LOGIN, error="Invalid credentials")
+
+@app.route("/v3/bronx-server-admin-panel/panel")
 @admin_required
-def admin_dashboard():
-    users = User.query.all()
-    prime_users = User.query.filter_by(is_prime=True).all()
-    return render_template('admin.html', 
-        total_users=len(users), total_prime_users=len(prime_users),
-        total_txns=Transaction.query.filter_by(status='PAID').count(),
-        total_revenue=db.session.query(db.func.sum(Transaction.amount)).filter_by(status='PAID').scalar() or 0,
-        features=Feature.query.all(), users_list=users, prime_users=prime_users,
-        broadcasts=Broadcast.query.all()
-    )
-
-@app.route('/v3/bronx-server-admin-panel/logout')
-def admin_logout():
-    session.pop('admin_logged_in', None)
-    return redirect(url_for('admin_login'))
-
-@app.route('/v3/bronx-server-admin-panel/add-feature', methods=['POST'])
-@admin_required
-def add_feature():
-    db.session.add(Feature(name=request.form.get('name'), icon=request.form.get('icon'), api_url=request.form.get('api_url')))
-    db.session.commit()
-    flash('Feature added!', 'success')
-    return redirect(url_for('admin_dashboard'))
-
-@app.route('/v3/bronx-server-admin-panel/toggle-feature/<int:id>')
-@admin_required
-def toggle_feature(id):
-    feat = Feature.query.get_or_404(id)
-    feat.is_visible = not feat.is_visible
-    db.session.commit()
-    return redirect(url_for('admin_dashboard'))
-
-@app.route('/v3/bronx-server-admin-panel/delete-feature/<int:id>')
-@admin_required
-def delete_feature(id):
-    db.session.delete(Feature.query.get_or_404(id))
-    db.session.commit()
-    return redirect(url_for('admin_dashboard'))
-
-@app.route('/v3/bronx-server-admin-panel/broadcast', methods=['POST'])
-@admin_required
-def broadcast():
-    if request.form.get('message'):
-        db.session.add(Broadcast(message=request.form.get('message')))
-        db.session.commit()
-        flash('Broadcast sent!', 'success')
-    return redirect(url_for('admin_dashboard'))
-
-# --- DATA EXPORT / IMPORT ---
-@app.route('/v3/bronx-server-admin-panel/export-data')
-@admin_required
-def export_data():
-    data = {
-        "users": [{"name": u.name, "username": u.username, "email": u.email, "prime": u.is_prime} for u in User.query.all()],
-        "features": [{"name": f.name, "icon": f.icon, "api_url": f.api_url} for f in Feature.query.all()],
+def admin_panel():
+    db = users()
+    txs = transactions()
+    stats = {
+        "users": len(db),
+        "prime_users": sum(1 for u in db.values() if u.get("prime")),
+        "total_payments": sum(1 for t in txs if t.get("status") == "PAID"),
+        "total_revenue": sum(t.get("amount", 0) for t in txs if t.get("status") == "PAID"),
     }
-    response = make_response(json.dumps(data, indent=4))
-    response.headers["Content-Disposition"] = "attachment; filename=bronx_backup.json"
-    response.headers["Content-type"] = "application/json"
-    return response
+    return render(TPL_ADMIN_PANEL, stats=stats, users=db,
+                  features=features(), plans=plans(),
+                  transactions=txs[-50:][::-1])
 
-@app.route('/v3/bronx-server-admin-panel/import-data', methods=['POST'])
+@app.route("/v3/bronx-server-admin-panel/features/add", methods=["POST"])
 @admin_required
-def import_data():
-    if 'file' not in request.files: return redirect(url_for('admin_dashboard'))
-    file = request.files['file']
-    if file.filename == '': return redirect(url_for('admin_dashboard'))
-    
-    if file:
+def admin_add_feature():
+    feats = features()
+    nid = "f" + secrets.token_hex(4)
+    feats.append({
+        "id": nid,
+        "name": request.form.get("name", "New Feature"),
+        "icon": request.form.get("icon", "fa-star"),
+        "api": request.form.get("api", ""),
+        "input_label": request.form.get("input_label", "Value"),
+        "visible": True,
+        "free_limit": int(request.form.get("free_limit", 0) or 0),
+        "prime_only": request.form.get("prime_only") == "on"
+    })
+    save("features", feats)
+    flash("Feature added", "success")
+    return redirect(url_for("admin_panel"))
+
+@app.route("/v3/bronx-server-admin-panel/features/<fid>/toggle")
+@admin_required
+def admin_toggle_feature(fid):
+    feats = features()
+    for f in feats:
+        if f["id"] == fid:
+            f["visible"] = not f.get("visible", True)
+            break
+    save("features", feats)
+    return redirect(url_for("admin_panel"))
+
+@app.route("/v3/bronx-server-admin-panel/features/<fid>/delete")
+@admin_required
+def admin_delete_feature(fid):
+    feats = [f for f in features() if f["id"] != fid]
+    save("features", feats)
+    flash("Feature deleted", "success")
+    return redirect(url_for("admin_panel"))
+
+@app.route("/v3/bronx-server-admin-panel/plans/update", methods=["POST"])
+@admin_required
+def admin_update_plan():
+    pl = plans()
+    for p in pl:
+        try:
+            p["price"] = int(request.form.get(f"price_{p['id']}", p["price"]))
+            p["limit"] = int(request.form.get(f"limit_{p['id']}", p["limit"]))
+        except Exception:
+            pass
+    save("plans", pl)
+    flash("Plans updated", "success")
+    return redirect(url_for("admin_panel"))
+
+@app.route("/v3/bronx-server-admin-panel/export")
+@admin_required
+def admin_export():
+    backup = {
+        "users": users(), "features": features(),
+        "plans": plans(), "transactions": transactions(),
+        "exported_at": datetime.now().isoformat(),
+        "brand": "BRONX ULTRA"
+    }
+    path = os.path.join(DATA_DIR, "backup.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(backup, f, indent=2, ensure_ascii=False)
+    return send_file(path, as_attachment=True, download_name=f"bronx_backup_{int(time.time())}.json")
+
+@app.route("/v3/bronx-server-admin-panel/import", methods=["POST"])
+@admin_required
+def admin_import():
+    file = request.files.get("backup")
+    if not file:
+        flash("No file uploaded", "error")
+        return redirect(url_for("admin_panel"))
+    try:
         data = json.load(file)
-        # Note: Simplified import logic for safety. Add try/except in production.
-        for f in data.get('features', []):
-            if not Feature.query.filter_by(name=f['name']).first():
-                db.session.add(Feature(name=f['name'], icon=f['icon'], api_url=f['api_url']))
-        db.session.commit()
-        flash('Data Imported Successfully!', 'success')
-    return redirect(url_for('admin_dashboard'))
+        if "users" in data: save("users", data["users"])
+        if "features" in data: save("features", data["features"])
+        if "plans" in data: save("plans", data["plans"])
+        if "transactions" in data: save("transactions", data["transactions"])
+        flash("Data imported successfully", "success")
+    except Exception as e:
+        flash(f"Import failed: {e}", "error")
+    return redirect(url_for("admin_panel"))
 
-# ==========================================
-# AUTO-GENERATE TEMPLATES (ALL-IN-ONE)
-# ==========================================
-def create_templates():
-    os.makedirs('templates', exist_ok=True)
-    templates = {
-        "base.html": """<!DOCTYPE html><html><head><title>BRONX ULTRA</title><script src="https://cdn.tailwindcss.com"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"></head><body class="bg-gray-100 flex h-screen"><div class="w-64 bg-gray-900 text-white flex flex-col"><div class="p-6 text-center border-b border-gray-700"><h1 class="text-2xl font-bold">BRONX ULTRA</h1><p class="text-xs text-gray-400">OSINT</p></div><nav class="flex-1"><a href="/dashboard" class="block p-4 hover:bg-gray-800"><i class="fas fa-home mr-2"></i>Dashboard</a><a href="/account" class="block p-4 hover:bg-gray-800"><i class="fas fa-user mr-2"></i>Account</a><a href="/history" class="block p-4 hover:bg-gray-800"><i class="fas fa-history mr-2"></i>History</a><a href="/buy-prime" class="block p-4 bg-blue-600 hover:bg-blue-700"><i class="fas fa-crown mr-2"></i>BUY PRIME</a></nav><div class="p-4 border-t border-gray-700"><p class="text-sm mb-2">Contact: <a href="https://t.me/BRONX_ULTRA" target="_blank" class="text-blue-400 font-bold">@BRONX_ULTRA</a></p><a href="/logout" class="block text-center bg-red-600 p-2 rounded">Logout</a></div></div><div class="flex-1 flex flex-col h-screen overflow-y-auto"><header class="bg-white shadow p-4"><h2 class="text-xl font-bold">{% block header %}Dashboard{% endblock %}</h2></header><main class="p-6">{% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}{% for c,m in messages %}<div class="p-4 mb-4 rounded {% if c=='error' %}bg-red-100 text-red-700{% else %}bg-green-100 text-green-700{% endif %}">{{ m }}</div>{% endfor %}{% endif %}{% endwith %}{% block content %}{% endblock %}</main></div></body></html>""",
-        
-        "index.html": """<!DOCTYPE html><html><head><title>BRONX ULTRA</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-gray-900 h-screen flex items-center justify-center text-white"><div class="bg-gray-800 p-8 rounded-xl shadow-2xl text-center max-w-sm w-full"><h1 class="text-4xl font-black mb-2 text-blue-500">BRONX ULTRA</h1><p class="text-gray-400 mb-8">OSINT Platform</p><a href="/login" class="block w-full bg-blue-600 p-3 rounded mb-2 font-bold hover:bg-blue-700">Login</a><a href="/register" class="block w-full bg-gray-700 p-3 rounded font-bold hover:bg-gray-600">Register</a><p class="mt-6 text-sm text-gray-500">Support: <a href="https://t.me/BRONX_ULTRA" class="text-blue-400">@BRONX_ULTRA</a></p></div></body></html>""",
-        
-        "login.html": """{% extends 'base.html' %}{% block content %}<div class="max-w-md mx-auto bg-white p-8 rounded shadow mt-10"><h2 class="text-2xl font-bold mb-6 text-center">Login</h2><form method="POST"><input type="text" name="identifier" placeholder="Username or Email" required class="w-full p-3 border rounded mb-4"><input type="password" name="password" placeholder="Password" required class="w-full p-3 border rounded mb-4"><button class="w-full bg-blue-600 text-white p-3 rounded font-bold">Login</button></form><p class="text-center mt-4 text-sm">No account? <a href="/register" class="text-blue-600 font-bold">Register</a></p></div>{% endblock %}""",
-        
-        "register.html": """{% extends 'base.html' %}{% block content %}<div class="max-w-md mx-auto bg-white p-8 rounded shadow mt-10"><h2 class="text-2xl font-bold mb-6 text-center">Register</h2><form method="POST"><input type="text" name="name" placeholder="Full Name" required class="w-full p-3 border rounded mb-4"><input type="text" name="username" placeholder="Username" required class="w-full p-3 border rounded mb-4"><input type="email" name="email" placeholder="Email" required class="w-full p-3 border rounded mb-4"><input type="password" name="password" placeholder="Password (5-12 chars)" required minlength="5" maxlength="12" class="w-full p-3 border rounded mb-4"><button class="w-full bg-green-600 text-white p-3 rounded font-bold">Create Account</button></form></div>{% endblock %}""",
-        
-        "dashboard.html": """{% extends 'base.html' %}{% block header %}Dashboard{% endblock %}{% block content %}<div class="grid grid-cols-3 gap-4 mb-6"><div class="bg-white p-4 rounded shadow border-l-4 border-blue-500"><p class="text-gray-500 text-sm">Date & Time</p><p class="font-bold">{{ now.strftime('%d %b %Y, %I:%M %p') }}</p></div><div class="bg-white p-4 rounded shadow border-l-4 border-green-500"><p class="text-gray-500 text-sm">Prime Status</p>{% if current_user.is_prime %}<p class="font-bold text-green-600">Active ({{ current_user.prime_plan_name }})</p>{% else %}<p class="font-bold text-red-600">Inactive</p>{% endif %}</div><div class="bg-white p-4 rounded shadow border-l-4 border-purple-500"><p class="text-gray-500 text-sm">Searches Left</p>{% if current_user.is_prime %}<p class="font-bold text-purple-600">{{ current_user.prime_limit - current_user.searches_used }}</p>{% else %}<p class="font-bold text-gray-400">0</p>{% endif %}</div></div>{% if broadcasts %}<div class="bg-yellow-50 p-4 rounded border border-yellow-300 mb-6"><h3 class="font-bold text-yellow-800 mb-2"><i class="fas fa-bullhorn"></i> Announcements</h3><ul>{% for b in broadcasts %}<li>{{ b.message }}</li>{% endfor %}</ul></div>{% endif %}<h3 class="text-xl font-bold mb-4">Premium Lookups</h3><div class="grid grid-cols-4 gap-4">{% for f in features %}<a href="/feature/{{ f.id }}" class="bg-white p-6 rounded shadow text-center hover:shadow-lg transition"><div class="text-blue-600 text-3xl mb-2"><i class="{{ f.icon }}"></i></div><h4 class="font-bold">{{ f.name }}</h4></a>{% endfor %}</div>{% endblock %}""",
-        
-        "features.html": """{% extends 'base.html' %}{% block header %}{{ feature.name }}{% endblock %}{% block content %}<div class="max-w-3xl mx-auto"><div class="bg-white p-6 rounded shadow mb-6"><h2 class="text-2xl font-bold mb-4"><i class="{{ feature.icon }} text-blue-500"></i> {{ feature.name }}</h2><p class="text-sm font-bold text-blue-600 mb-4">Remaining: {{ remaining }}</p><form method="POST" class="flex gap-2"><input type="text" name="query" value="{{ query }}" required class="flex-1 p-3 border rounded font-mono"><button class="bg-blue-600 text-white px-6 rounded font-bold">Search</button></form></div>{% if error %}<div class="bg-red-100 text-red-700 p-4 rounded mb-6">{{ error }}</div>{% endif %}{% if result %}<div class="bg-gray-900 rounded overflow-hidden"><div class="bg-gray-800 p-2 text-xs text-green-400 font-bold">API RESPONSE</div><pre class="p-6 text-green-400 font-mono text-sm overflow-auto max-h-96">{{ result }}</pre></div>{% endif %}</div>{% endblock %}""",
-        
-        "buy_prime.html": """{% extends 'base.html' %}{% block header %}Buy Prime{% endblock %}{% block content %}<div class="grid grid-cols-4 gap-4">{% for k, p in plans.items() %}<div class="bg-white p-6 rounded shadow text-center border hover:border-blue-500"><h3 class="font-bold">{{ p.name }}</h3><p class="text-3xl font-black text-blue-600 my-2">₹{{ p.price }}</p><p class="text-sm text-gray-600">{{ p.limit }} Searches</p><p class="text-sm text-gray-600 mb-4">{{ p.days }} Days</p><a href="/process-payment/{{ k }}" class="block bg-blue-600 text-white p-2 rounded">Buy Now</a></div>{% endfor %}</div>{% endblock %}""",
-        
-        "payment.html": """{% extends 'base.html' %}{% block header %}Payment{% endblock %}{% block content %}<div class="max-w-md mx-auto bg-white p-8 rounded shadow text-center"><h2 class="text-2xl font-bold mb-2">{{ plan.name }}</h2><p class="text-4xl font-black text-blue-600 mb-6">₹{{ plan.price }}</p><div class="mb-6"><a href="{{ payment_url }}" target="_blank" class="bg-blue-600 text-white px-6 py-3 rounded font-bold shadow">Open Payment Page</a></div><div id="status" class="bg-yellow-100 text-yellow-700 p-4 rounded font-bold">Waiting for payment...</div></div><script>setInterval(()=>{fetch('/check-payment/{{ order_id }}').then(r=>r.json()).then(d=>{if(d.status=='PAID'){document.getElementById('status').className='bg-green-100 text-green-700 p-4 rounded font-bold';document.getElementById('status').innerText='Success! Activating...';setTimeout(()=>window.location.href='/dashboard',2000);}})},5000);</script>{% endblock %}""",
-        
-        "account.html": """{% extends 'base.html' %}{% block header %}Account{% endblock %}{% block content %}<div class="max-w-xl mx-auto bg-white p-8 rounded shadow"><h2 class="text-2xl font-bold mb-4">{{ current_user.username }}</h2><p class="text-gray-600 mb-6">{{ current_user.email }}</p><div class="bg-gray-50 p-4 rounded mb-4 border">{% if current_user.is_prime %}<p class="text-green-600 font-bold">Prime Active ({{ current_user.prime_plan_name }})</p><p class="text-sm">Expires: {{ current_user.prime_expiry.strftime('%d %b %Y') }}</p><p class="text-sm">Usage: {{ current_user.searches_used }}/{{ current_user.prime_limit }}</p>{% else %}<p class="text-red-500 font-bold">No Prime</p>{% endif %}</div><div class="bg-gray-100 p-4 rounded font-mono text-xs text-gray-500"><p>IP: {{ current_user.ip_address }}</p><p>Device: {{ current_user.device_type }}</p><p>OS: {{ current_user.os_info }}</p><p>Browser: {{ current_user.browser_info }}</p></div></div>{% endblock %}""",
-        
-        "history.html": """{% extends 'base.html' %}{% block header %}History{% endblock %}{% block content %}<div class="bg-white p-6 rounded shadow"><table class="w-full text-left"><tr class="border-b"><th>Feature</th><th>Query</th><th>Date</th></tr>{% for r in records %}<tr class="border-b"><td class="p-2">{{ r.feature_name }}</td><td class="p-2 font-mono">{{ r.query }}</td><td class="p-2 text-sm">{{ r.timestamp.strftime('%d %b, %I:%M %p') }}</td></tr>{% endfor %}</table></div>{% endblock %}""",
-        
-        "admin_login.html": """<html><head><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-gray-900 flex items-center justify-center h-screen"><form method="POST" class="bg-white p-8 rounded shadow w-80"><h2 class="text-xl font-bold mb-4 text-center">Admin</h2><input type="text" name="username" placeholder="User" required class="w-full p-2 border rounded mb-2"><input type="password" name="password" placeholder="Pass" required class="w-full p-2 border rounded mb-4"><button class="w-full bg-red-600 text-white p-2 rounded">Login</button></form></body></html>""",
-        
-        "admin.html": """<html><head><script src="https://cdn.tailwindcss.com"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"></head><body class="bg-gray-100"><nav class="bg-gray-900 text-white p-4 flex justify-between"><h1>BRONX ADMIN</h1><a href="/v3/bronx-server-admin-panel/logout" class="text-red-400">Logout</a></nav><div class="p-6"><div class="grid grid-cols-4 gap-4 mb-6"><div class="bg-white p-4 rounded"><p class="text-xs text-gray-500">Users</p><p class="text-xl font-bold">{{ total_users }}</p></div><div class="bg-white p-4 rounded"><p class="text-xs text-gray-500">Prime Users</p><p class="text-xl font-bold text-green-600">{{ total_prime_users }}</p></div><div class="bg-white p-4 rounded"><p class="text-xs text-gray-500">Payments</p><p class="text-xl font-bold">{{ total_txns }}</p></div><div class="bg-white p-4 rounded"><p class="text-xs text-gray-500">Revenue</p><p class="text-xl font-bold text-blue-600">₹{{ total_revenue }}</p></div></div><div class="grid grid-cols-2 gap-4 mb-6"><div class="bg-white p-4 rounded shadow"><h3 class="font-bold mb-2">Add Feature</h3><form action="/v3/bronx-server-admin-panel/add-feature" method="POST"><input name="name" placeholder="Name" required class="w-full p-2 border rounded mb-2"><input name="icon" placeholder="Icon (fa-solid fa-car)" required class="w-full p-2 border rounded mb-2"><input name="api_url" placeholder="URL (http://api.com/num={p})" required class="w-full p-2 border rounded mb-2"><button class="bg-blue-600 text-white p-2 rounded w-full">Add</button></form></div><div class="bg-white p-4 rounded shadow"><h3 class="font-bold mb-2">Broadcast</h3><form action="/v3/bronx-server-admin-panel/broadcast" method="POST"><textarea name="message" required class="w-full p-2 border rounded mb-2"></textarea><button class="bg-yellow-500 text-white p-2 rounded w-full">Send</button></form><div class="mt-4 flex gap-2"><a href="/v3/bronx-server-admin-panel/export-data" class="bg-green-600 text-white p-2 rounded flex-1 text-center">Export Data</a><form action="/v3/bronx-server-admin-panel/import-data" method="POST" enctype="multipart/form-data" class="flex-1 flex gap-1"><input type="file" name="file" accept=".json" class="text-xs w-full border p-1"><button class="bg-purple-600 text-white px-2 rounded">Import</button></form></div></div></div><div class="bg-white p-4 rounded shadow mb-6"><h3 class="font-bold mb-2">Prime Users List</h3><table class="w-full text-left text-sm"><tr class="border-b"><th>Username</th><th>Email</th><th>Plan</th><th>Expiry</th></tr>{% for u in prime_users %}<tr class="border-b"><td>{{ u.username }}</td><td>{{ u.email }}</td><td>{{ u.prime_plan_name }}</td><td>{{ u.prime_expiry.strftime('%d %b %Y') }}</td></tr>{% endfor %}</table></div><div class="bg-white p-4 rounded shadow"><h3 class="font-bold mb-2">Features</h3><table class="w-full text-left text-sm"><tr class="border-b"><th>Name</th><th>URL</th><th>Status</th><th>Actions</th></tr>{% for f in features %}<tr class="border-b"><td class="p-2">{{ f.name }}</td><td class="p-2 font-mono text-xs">{{ f.api_url }}</td><td class="p-2">{% if f.is_visible %}Visible{% else %}Hidden{% endif %}</td><td class="p-2"><a href="/v3/bronx-server-admin-panel/toggle-feature/{{ f.id }}" class="text-blue-600">Toggle</a> | <a href="/v3/bronx-server-admin-panel/delete-feature/{{ f.id }}" class="text-red-600">Delete</a></td></tr>{% endfor %}</table></div></div></body></html>"""
-    }
-    
-    for filename, content in templates.items():
-        with open(os.path.join('templates', filename), 'w', encoding='utf-8') as f:
-            f.write(content)
+@app.route("/v3/bronx-server-admin-panel/broadcast", methods=["POST"])
+@admin_required
+def admin_broadcast():
+    msg = request.form.get("msg", "").strip()
+    if msg:
+        save("broadcast", {"msg": msg, "time": datetime.now().isoformat()})
+        flash("Broadcast saved", "success")
+    return redirect(url_for("admin_panel"))
 
-# Initialize Database and Templates
-with app.app_context():
-    create_templates()
-    db.create_all()
-    if Feature.query.count() == 0:
-        db.session.bulk_save_objects([
-            Feature(name="Number Info", icon="fa-solid fa-sim-card", api_url="https://api.example.com/num={p}"),
-            Feature(name="Aadhar To PAN", icon="fa-solid fa-id-card-clip", api_url="https://api.example.com/aadhar={p}"),
-            Feature(name="Vehicle RC", icon="fa-solid fa-car", api_url="https://api.example.com/rc={p}"),
-            Feature(name="UPI Info", icon="fa-solid fa-indian-rupee-sign", api_url="https://api.example.com/upi={p}")
-        ])
-        db.session.commit()
+@app.route("/v3/bronx-server-admin-panel/logout")
+def admin_logout():
+    session.pop("admin", None)
+    return redirect(url_for("admin_login"))
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+# ══════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
